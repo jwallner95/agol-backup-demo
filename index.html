@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>One-click FGDB Export</title>
+<script src="https://js.arcgis.com/4.29/"></script>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Arial,sans-serif;margin:2rem}
+  .card{max-width:720px;margin:auto;padding:1.25rem;border:1px solid #ddd;border-radius:12px;text-align:center}
+  .log{white-space:pre-wrap;font-size:.9rem;background:#fafafa;padding:.75rem;border-radius:8px;border:1px solid #eee;margin-top:1rem;text-align:left}
+  .ok{color:#087443;font-weight:700;font-size:1.4rem;display:flex;align-items:center;justify-content:center;gap:.5rem}
+  .ok::before{content:"✔";font-size:1.6rem;color:#087443}
+  .subline{margin-top:.5rem;font-size:1rem;color:#444}
+  .err{color:#a40000;font-weight:600}
+  a{text-decoration:none}
+</style>
+<script>
+/* ── EDIT THIS ONE ───────────────────────────────────────────── */
+const CLIENT_ID         = "YOUR_CLIENT_ID_HERE";
+/* ────────────────────────────────────────────────────────────── */
+
+/* Org + job config */
+const PORTAL_URL        = "https://cwa-scotland.maps.arcgis.com";
+const FEATURE_ITEM_ID   = "815bce2d28c644c585da07c6ec793b45";
+const TITLE_PREFIX      = "DEMO_BE_Wint_ASB_Backup_";
+const POLL_TIMEOUT_MS   = 6*60*1000, POLL_INTERVAL_MS = 2500;
+
+const log = (m) => document.getElementById('log').textContent += m + "\n";
+const ts  = () => new Date().toISOString().replace(/[:.]/g,'-');
+
+require([
+  "esri/identity/OAuthInfo",
+  "esri/identity/IdentityManager",
+  "esri/request"
+], (OAuthInfo, IdentityManager, esriRequest) => {
+
+  /** Auto-signed POST via IdentityManager **/
+  function signedPost(pathOrUrl, query = {}) {
+    const url = pathOrUrl.startsWith("http")
+      ? pathOrUrl
+      : `${PORTAL_URL}/sharing/rest/${pathOrUrl}`;
+    return esriRequest(url, {
+      method: "post",
+      query: { f: "json", ...query },
+      responseType: "json"
+    }).then(r => {
+      const data = r.data || {};
+      if (data.error) throw new Error(data.error.message || JSON.stringify(data.error));
+      return data;
+    });
+  }
+
+  async function getMe(){
+    const me = await signedPost("community/self");
+    log(`Signed in as: ${me.username}`);
+    return me;
+  }
+
+  function getPortalToken(){
+    return new Promise((resolve,reject)=>{
+      require(["esri/identity/IdentityManager"], IdMgr=>{
+        const cred = IdMgr.findCredential(`${PORTAL_URL}/sharing`);
+        if (cred && cred.token) resolve(cred.token); else reject(new Error("No token"));
+      });
+    });
+  }
+
+  /** HEAD the data URL; if 200 with content-length > 0, file is ready **/
+  async function isDownloadReady(exportItemId){
+    try{
+      const token = await getPortalToken();
+      const url = `${PORTAL_URL}/sharing/rest/content/items/${exportItemId}/data?token=${encodeURIComponent(token)}`;
+      const r = await fetch(url, { method: "HEAD" });
+      if (!r.ok) return false;
+      const len = Number(r.headers.get("content-length") || "0");
+      return len > 0;
+    }catch{ return false; }
+  }
+
+  /** Robust status check: /items, /items/status, HEAD on data **/
+  async function checkExportStatusStrong(exportItemId){
+    const itemBase = `${PORTAL_URL}/sharing/rest/content/items/${exportItemId}`;
+
+    // 1) /items/{id}
+    try{
+      const a = await signedPost(itemBase);
+      if (a.status) return a.status.toLowerCase();
+      if ((a.type === "File Geodatabase" || a.type === "File Geodatabase (zipped)") && Number(a.size || 0) > 0) {
+        return "completed";
+      }
+    }catch(_){}
+
+    // 2) /items/{id}/status
+    try{
+      const b = await signedPost(`${itemBase}/status`);
+      if (b.status) return b.status.toLowerCase();
+      if (b.error && b.error.message) return `failed:${b.error.message}`;
+    }catch(_){}
+
+    // 3) HEAD on data
+    if (await isDownloadReady(exportItemId)) return "completed";
+
+    return "processing";
+  }
+
+  async function doExportFlow(){
+    const me = await getMe();
+    const username = me.username;
+    const exportTitle = `${TITLE_PREFIX}${ts()}`;
+
+    log(`Kicking off export as '${exportTitle}'…`);
+
+    // 1) Start export (lands in user's root by default)
+    const start = await signedPost(`content/users/${encodeURIComponent(username)}/export`, {
+      itemId: FEATURE_ITEM_ID,
+      exportFormat: "File Geodatabase",
+      exportParameters: JSON.stringify({ layers: [] }),
+      title: exportTitle
+    });
+    const exportItemId = start.exportItemId;
+    if (!exportItemId) throw new Error("Export did not return exportItemId.");
+
+    // 2) Poll for completion
+    let status = "processing";
+    const t0 = Date.now();
+    await new Promise(r => setTimeout(r, 2000));
+    while (true){
+      if (Date.now() - t0 > POLL_TIMEOUT_MS) throw new Error("Timeout waiting for export.");
+      status = await checkExportStatusStrong(exportItemId);
+      log(`Status: ${status}`);
+      if (status === "completed") break;
+      if (status.startsWith("failed")) throw new Error(status);
+      if (["failed","canceled","unknown"].includes(status)) throw new Error(`Export failed with status: ${status}`);
+      await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+    }
+
+    // 3) Update metadata (tags/description). Item remains in root.
+    await signedPost(`content/users/${encodeURIComponent(username)}/items/${exportItemId}/update`, {
+      tags: "backup,filegdb,automated",
+      description: `Automated backup of ${FEATURE_ITEM_ID} on ${new Date().toUTCString()}`
+    });
+
+    // Final message (styled)
+    document.getElementById('status').innerHTML =
+      `<div class="ok">BACKUP COMPLETE</div><div class="subline">Window will close automatically</div>`;
+
+    // Provide quick link
+    const itemUrl = `${PORTAL_URL}/home/item.html?id=${exportItemId}`;
+    log(`Item: ${itemUrl}`);
+
+    // Close after 5 seconds (less abrupt)
+    setTimeout(() => { tryClosePage(); }, 5000);
+  }
+
+  // OAuth bootstrap (redirect flow = one-click from ExB)
+  const info = new OAuthInfo({ appId: CLIENT_ID, portalUrl: PORTAL_URL, popup: false, flowType: "auto" });
+  IdentityManager.registerOAuthInfos([info]);
+  IdentityManager.checkSignInStatus(`${PORTAL_URL}/sharing`)
+    .then(afterSignIn)
+    .catch(() => IdentityManager.getCredential(`${PORTAL_URL}/sharing`).then(afterSignIn));
+
+  async function afterSignIn(){
+    document.getElementById('status').textContent = "Starting export…";
+    try{ await doExportFlow(); }
+    catch(e){ document.getElementById('status').innerHTML = '<span class="err">Error</span>'; log(e && e.message ? e.message : String(e)); }
+  }
+
+  function tryClosePage(){
+    try { window.opener && window.opener.postMessage({ type: 'AGOL_BACKUP_COMPLETE' }, '*'); } catch(_){}
+    try { window.close(); } catch(_){}
+    setTimeout(() => { try { window.open('', '_self'); window.close(); } catch(_){} }, 500);
+  }
+
+  // breadcrumbs
+  log(`PORTAL_URL=${PORTAL_URL}`);
+  log(`CLIENT_ID=${CLIENT_ID}`);
+  log(`PAGE_URL=${location.href}`);
+});
+</script>
+</head>
+<body>
+  <div class="card">
+    <h2>Export hosted layer to File Geodatabase</h2>
+    <p id="status">Authorizing…</p>
+    <div id="log" class="log"></div>
+  </div>
+</body>
+</html>
